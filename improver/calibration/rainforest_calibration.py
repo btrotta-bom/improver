@@ -187,25 +187,23 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         """
         from lightgbm import Booster
 
-        # Model config is a nested dictionary. Keys of outer level are lead times, and
-        # keys of inner level are thresholds. Convert these to int and float.
-        sorted_model_config_dict = OrderedDict()
-        for lead_time_key in sorted(list(model_config_dict.keys())):
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict()
-            lead_time_dict = model_config_dict[lead_time_key]
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict(
-                sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
-            )
+        # Dictionary keys represent error thresholds, however may be strings as they
+        # are sourced from json files. In order use these in processing, and to sort
+        # them in a sensible fashion, we shall cast the key values as float32.
+        sorted_model_config_dict = OrderedDict(
+            sorted({np.float32(k): v for k, v in model_config_dict.items()}.items())
+        )
 
-        self.lead_times = np.array([*sorted_model_config_dict.keys()])
-        self.model_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]].keys()])
+        self.model_thresholds = np.array([*sorted_model_config_dict.keys()])
         self.model_input_converter = np.array
-        self.tree_models = {}
-        for lead_time in self.lead_times:
-            for threshold in self.model_thresholds:
-                model_filename = Path(sorted_model_config_dict[lead_time][threshold].get("lightgbm_model")).expanduser()
-                self.tree_models[lead_time, threshold] = Booster(model_file=str(model_filename)).reset_parameter({"num_threads": threads})
-
+        lightgbm_model_filenames = [
+            Path(threshold_dict.get("lightgbm_model")).expanduser()
+            for threshold_dict in sorted_model_config_dict.values()
+        ]
+        self.tree_models = [
+            Booster(model_file=str(file)).reset_parameter({"num_threads": threads})
+            for file in lightgbm_model_filenames
+        ]
     def _check_num_features(self, features: CubeList) -> None:
         """Check that the correct number of features has been passed into the model.
 
@@ -213,7 +211,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             features:
                 Cubelist containing feature variables.
         """
-        expected_num_features = list(self.tree_models.values())[0].num_feature()
+        expected_num_features = self.tree_models[0].num_feature()
         if expected_num_features != len(features):
             raise ValueError(
                 "Number of expected features does not match number of feature cubes."
@@ -399,7 +397,6 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         self,
         forecast_data: ndarray,
         input_data: ndarray,
-        lead_time_hours: int,
         forecast_variable: str,
         forecast_variable_unit: str,
         output_data: ndarray,
@@ -413,8 +410,6 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 1-d containing data for the variable to be calibrated.
             input_data:
                 2-d array of data for the feature variables of the model
-            lead_time_hours:
-                lead time in hours
             forecast_variable:
                 name of forecast variable
             forecast_variable_unit:
@@ -433,7 +428,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         )
 
         for threshold_index, threshold in enumerate(self.model_thresholds):
-            model = self.tree_models[lead_time_hours, threshold]
+            model = self.tree_models[threshold_index]
             prediction = model.predict(input_dataset)
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
@@ -467,12 +462,10 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         input_dataset = self._prepare_features_array(feature_cubes)
 
         forecast_data = forecast_cube.data.ravel()
-        lead_time_hours = forecast_cube.coord("forecast_period").points[0] / (SECONDS_IN_MINUTE * MINUTES_IN_HOUR)
 
         self._evaluate_probabilities(
             forecast_data,
             input_dataset,
-            lead_time_hours,
             forecast_cube.name(),
             forecast_cube.units,
             threshold_probability_cube.data,
@@ -668,32 +661,30 @@ class ApplyRainForestsCalibrationTreelite(ApplyRainForestsCalibrationLightGBM):
         """
         from treelite_runtime import DMatrix, Predictor
 
-        # Model config is a nested dictionary. Keys of outer level are lead times, and
-        # keys of inner level are thresholds. Convert these to int and float.
-        sorted_model_config_dict = OrderedDict()
-        for lead_time_key in sorted(list(model_config_dict.keys())):
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict()
-            lead_time_dict = model_config_dict[lead_time_key]
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict(
-                sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
-            )
+        # Dictionary keys represent error thresholds, however may be strings as they
+        # are sourced from json files. In order use these in processing, and to sort
+        # them in a sensible fashion, we shall cast the key values as float32.
+        sorted_model_config_dict = OrderedDict(
+            sorted({np.float32(k): v for k, v in model_config_dict.items()}.items())
+        )
 
-        self.lead_times = np.array([*sorted_model_config_dict.keys()])
-        self.model_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]].keys()])
+        self.model_thresholds = np.array([*sorted_model_config_dict.keys()])
         self.model_input_converter = DMatrix
-        self.tree_models = {}
-        for lead_time in self.lead_times:
-            for threshold in self.model_thresholds:
-                model_filename = Path(sorted_model_config_dict[lead_time][threshold].get("treelite_model")).expanduser()
-                self.tree_models[lead_time, threshold] = Predictor(libpath=str(model_filename), verbose=False, nthread=threads)
-
+        treelite_model_filenames = [
+            Path(threshold_dict.get("treelite_model")).expanduser()
+            for threshold_dict in sorted_model_config_dict.values()
+        ]
+        self.tree_models = [
+            Predictor(libpath=str(file), verbose=False, nthread=threads)
+            for file in treelite_model_filenames
+        ]
     def _check_num_features(self, features: CubeList) -> None:
         """Check that the correct number of features has been passed into the model.
         Args:
             features:
                 Cubelist containing feature variables.
         """
-        expected_num_features = list(self.tree_models.values())[0].num_feature
+        expected_num_features = self.tree_models[0].num_feature
         if expected_num_features != len(features):
             raise ValueError(
                 "Number of expected features does not match number of feature cubes."
