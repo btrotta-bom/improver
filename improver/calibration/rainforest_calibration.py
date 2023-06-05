@@ -49,6 +49,7 @@ from iris.cube import Cube, CubeList
 from numpy import ndarray
 
 from improver import PostProcessingPlugin
+from improver.cli import threshold
 from improver.ensemble_copula_coupling.constants import BOUNDS_FOR_ECDF
 from improver.ensemble_copula_coupling.utilities import interpolate_multiple_rows_same_x
 from improver.metadata.utilities import (
@@ -211,7 +212,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             features:
                 Cubelist containing feature variables.
         """
-        expected_num_features = self.tree_models[0].num_feature()
+        expected_num_features = self.tree_models[0].num_feature() - 1
         if expected_num_features != len(features):
             raise ValueError(
                 "Number of expected features does not match number of feature cubes."
@@ -357,14 +358,17 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 If flattened cubes have differing length.
         """
         # Get the names of features and sort alphabetically
-        feature_variables = [cube.name() for cube in feature_cubes]
+        feature_variables = [cube.name() for cube in feature_cubes] + ["prop"]
         feature_variables.sort()
 
         # Unpack the cube-data into an array to feed into the tree-models.
         features_list = []
         for feature in feature_variables:
-            cube = feature_cubes.extract_cube(feature)
-            features_list.append(cube.data.ravel()[:, np.newaxis])
+            if feature == "prop":
+                features_list.append(np.zeros(feature_cubes[0].data.size)[:, np.newaxis])
+            else:
+                cube = feature_cubes.extract_cube(feature)
+                features_list.append(cube.data.ravel()[:, np.newaxis])
         features_arr = np.concatenate(features_list, axis=1)
 
         return features_arr
@@ -397,6 +401,8 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         self,
         forecast_data: ndarray,
         input_data: ndarray,
+        proportion_array: ndarray,
+        proportion_index,
         forecast_variable: str,
         forecast_variable_unit: str,
         output_data: ndarray,
@@ -418,7 +424,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 array to populate with output; will be modified in place
         """
 
-        input_dataset = self.model_input_converter(input_data)
+        #input_dataset = self.model_input_converter(input_data)
 
         bounds_data = BOUNDS_FOR_ECDF[forecast_variable]
         bounds_unit = unit.Unit(bounds_data[1])
@@ -428,12 +434,25 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         )
 
         for threshold_index, threshold in enumerate(self.model_thresholds):
+            input_data[:, proportion_index] = proportion_array[threshold_index]
+            input_dataset = self.model_input_converter(input_data)
             model = self.tree_models[threshold_index]
             prediction = model.predict(input_dataset)
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
             )
         return
+
+    def _get_proportion_data(self, forecast_cube: Cube) -> Cube:
+        proportion_list = []
+        for t in self.model_thresholds:
+            eps = np.finfo(np.float32).eps
+            threshold_cube = iris.util.squeeze(threshold.process(forecast_cube, threshold_values=[t - eps], comparison_operator=">="))
+            proportion_data = np.broadcast_to(threshold_cube.collapsed("realization", iris.analysis.MEAN).data, forecast_cube.data.shape)
+            proportion_list.append(proportion_data.flatten())
+        return proportion_list
+
+
 
     def _calculate_threshold_probabilities(
         self, forecast_cube: Cube, feature_cubes: CubeList,
@@ -459,13 +478,21 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
 
         threshold_probability_cube = self._prepare_threshold_probability_cube(forecast_cube)
 
+        proportion_array = self._get_proportion_data(forecast_cube)
+
         input_dataset = self._prepare_features_array(feature_cubes)
+        
+        feature_variables = [cube.name() for cube in feature_cubes] + ["prop"]
+        feature_variables.sort()
+        proportion_index = feature_variables.index("prop")
 
         forecast_data = forecast_cube.data.ravel()
 
         self._evaluate_probabilities(
             forecast_data,
             input_dataset,
+            proportion_array,
+            proportion_index,
             forecast_cube.name(),
             forecast_cube.units,
             threshold_probability_cube.data,
@@ -684,7 +711,7 @@ class ApplyRainForestsCalibrationTreelite(ApplyRainForestsCalibrationLightGBM):
             features:
                 Cubelist containing feature variables.
         """
-        expected_num_features = self.tree_models[0].num_feature
+        expected_num_features = self.tree_models[0].num_feature - 1
         if expected_num_features != len(features):
             raise ValueError(
                 "Number of expected features does not match number of feature cubes."
