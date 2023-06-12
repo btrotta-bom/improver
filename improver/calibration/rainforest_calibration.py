@@ -430,6 +430,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         for threshold_index, threshold in enumerate(self.model_thresholds):
             model = self.tree_models[threshold_index]
             prediction = model.predict(input_dataset)
+            prediction = np.maximum(0, np.minimum(1, prediction))
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
             )
