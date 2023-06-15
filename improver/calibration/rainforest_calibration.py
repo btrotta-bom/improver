@@ -50,10 +50,13 @@ from numpy import ndarray
 
 from improver import PostProcessingPlugin
 from improver.ensemble_copula_coupling.constants import BOUNDS_FOR_ECDF
-from improver.ensemble_copula_coupling.utilities import interpolate_multiple_rows_same_x
+from improver.ensemble_copula_coupling.utilities import interpolate_multiple_rows_same_x, interpolate_pointwise
 from improver.metadata.utilities import (
     create_new_diagnostic_cube,
     generate_mandatory_attributes,
+)
+from improver.ensemble_copula_coupling.utilities import (
+    get_bounds_of_distribution,
 )
 from improver.utilities.cube_manipulation import add_coordinate_to_cube, compare_coords
 from improver.constants import SECONDS_IN_MINUTE, MINUTES_IN_HOUR
@@ -187,24 +190,29 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         """
         from lightgbm import Booster
 
-        # Model config is a nested dictionary. Keys of outer level are lead times, and
-        # keys of inner level are thresholds. Convert these to int and float.
+        # Model config is a nested dictionary. Levels are lead time, threshold type, and threshold.
+        # Convert lead times to int and thresholds to float.
         sorted_model_config_dict = OrderedDict()
         for lead_time_key in sorted(list(model_config_dict.keys())):
             sorted_model_config_dict[int(lead_time_key)] = OrderedDict()
-            lead_time_dict = model_config_dict[lead_time_key]
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict(
-                sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
-            )
+            for threshold_type in ["fixed", "error"]:
+                sorted_model_config_dict[int(lead_time_key)][threshold_type] = OrderedDict()
+                lead_time_dict = model_config_dict[lead_time_key][threshold_type]
+                sorted_model_config_dict[int(lead_time_key)][threshold_type]  = OrderedDict(
+                    sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
+                )
 
         self.lead_times = np.array([*sorted_model_config_dict.keys()])
-        self.model_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]].keys()])
+        self.fixed_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["fixed"].keys()])
+        self.error_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["error"].keys()])
         self.model_input_converter = np.array
         self.tree_models = {}
         for lead_time in self.lead_times:
-            for threshold in self.model_thresholds:
-                model_filename = Path(sorted_model_config_dict[lead_time][threshold].get("lightgbm_model")).expanduser()
-                self.tree_models[lead_time, threshold] = Booster(model_file=str(model_filename)).reset_parameter({"num_threads": threads})
+            for threshold_type in ["fixed", "error"]:
+                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else "error"
+                for threshold in threshold_list:
+                    model_filename = Path(sorted_model_config_dict[lead_time][threshold_type][threshold].get("lightgbm_model")).expanduser()
+                    self.tree_models[lead_time, threshold_type, threshold] = Booster(model_file=str(model_filename)).reset_parameter({"num_threads": threads})
 
     def _check_num_features(self, features: CubeList) -> None:
         """Check that the correct number of features has been passed into the model.
@@ -307,13 +315,15 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
 
         return aligned_cubes[:-1], aligned_cubes[-1]
 
-    def _prepare_threshold_probability_cube(self, forecast_cube):
+    def _prepare_threshold_probability_cube(self, forecast_cube, output_thresholds):
         """Initialise a cube with the same dimensions as the input forecast_cube,
         with an additional threshold dimension added as the leading dimension.
 
         Args:
             forecast_cube:
                 Cube containing the forecast to be calibrated.
+            output_thresholds: List of output thresholds
+
 
         Returns:
             An empty probability cube.
@@ -328,7 +338,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             mandatory_attributes=generate_mandatory_attributes([forecast_cube]),
         )
         threshold_coord = DimCoord(
-            self.model_thresholds,
+            output_thresholds,
             long_name=forecast_variable,
             var_name="threshold",
             units=forecast_cube.units,
@@ -395,18 +405,13 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         )
         return 0.5 * (upper + lower)
 
-    def _evaluate_probabilities(
+    def _evaluate_fixed_probabilities(
         self,
-        forecast_data: ndarray,
         input_data: ndarray,
         lead_time_hours: int,
-        forecast_variable: str,
-        forecast_variable_unit: str,
         output_data: ndarray,
     ) -> None:
-        """Evaluate probability that forecast exceeds thresholds, setting
-        the result to 1 when `forecast + threshold` is less than or equal to
-        the lower bound of forecast_variable, as defined in constants.BOUNDS_FOR_ECDF`.
+        """Evaluate probability that forecast exceeds fixed thresholds.
 
         Args:
             forecast_data:
@@ -415,34 +420,75 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 2-d array of data for the feature variables of the model
             lead_time_hours:
                 lead time in hours
-            forecast_variable:
-                name of forecast variable
-            forecast_variable_unit:
-                unit of forecast variable
             output_data:
                 array to populate with output; will be modified in place
         """
 
         input_dataset = self.model_input_converter(input_data)
 
-        bounds_data = BOUNDS_FOR_ECDF[forecast_variable]
-        bounds_unit = unit.Unit(bounds_data[1])
-        lower_bound = bounds_data[0][0]
-        lower_bound_in_fcst_units = bounds_unit.convert(
-            lower_bound, forecast_variable_unit
-        )
-
-        for threshold_index, threshold in enumerate(self.model_thresholds):
-            model = self.tree_models[lead_time_hours, threshold]
+        for threshold_index, threshold in enumerate(self.fixed_thresholds):
+            model = self.tree_models[lead_time_hours, "fixed", threshold]
             prediction = model.predict(input_dataset)
             prediction = np.maximum(np.minimum(1, prediction), 0)
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
             )
         return
+    
+
+    def _evaluate_error_probabilities(
+        self,
+        forecast_data: ndarray,
+        input_data: ndarray,
+        lead_time_hours: int,
+        output_data: ndarray,
+    ) -> None:
+        """Evaluate probability that forecast error exceeds error thresholds.
+
+        Args:
+            forecast_data:
+                1-d containing data for the variable to be calibrated.
+            input_data:
+                2-d array of data for the feature variables of the model
+            lead_time_hours:
+                lead time in hours
+            output_data:
+                array to populate with output; will be modified in place
+        """
+
+        input_dataset = self.model_input_converter(input_data)
+
+        # bounds_data = get_bounds_of_distribution(
+        #     forecast_variable, forecast_variable_unit
+        # )
+        # lower_bound_in_fcst_units = bounds_data[0]
+
+        max_fixed_threshold = max(self.fixed_thresholds)
+
+        for threshold_index, threshold in enumerate(self.error_thresholds):
+            model = self.tree_models[lead_time_hours, "error", threshold]
+            # it is assumed that models have been trained using the >= operator
+            # (i.e. they predict the probabilty that error >= threshold)
+            threshold = self.error_thresholds[threshold_index]
+            if threshold >= 0:
+                # In this case, for all values of forecast we have
+                # forecast + threshold >= forecast >= lower_bound_in_fcst_units
+                prediction = model.predict(input_dataset)
+            else:
+                # Predict 1 where forecast + threshold > max_fixed_threshold
+                prediction = np.ones(input_data.shape[0], dtype=np.float32)
+                forecast_bool = forecast_data + threshold >= max_fixed_threshold
+                if np.any(forecast_bool):
+                    input_subset = self.model_input_converter(input_data[forecast_bool])
+                    prediction[forecast_bool] = model.predict(input_subset)
+            output_data[threshold_index, :] = np.reshape(
+                prediction, output_data.shape[1:]
+            )
+
+        return
 
     def _calculate_threshold_probabilities(
-        self, forecast_cube: Cube, feature_cubes: CubeList,
+        self, forecast_cube: Cube, feature_cubes: CubeList, output_thresholds: List[float]
     ) -> Cube:
         """Evaluate the threshold exceedence probabilities for each ensemble member in
         forecast_cube using the tree_models, with the associated feature_cubes taken as
@@ -453,6 +499,8 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 Cube containing the variable to be calibrated.
             feature_cubes:
                 Cubelist containing the independent feature variables for prediction.
+            output_thresholds:
+                Ordered list of thresholds at which to calculate the output probabilities.
 
         Returns:
             A cube containing threshold exceedence probabilities.
@@ -470,87 +518,70 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         forecast_data = forecast_cube.data.ravel()
         lead_time_hours = forecast_cube.coord("forecast_period").points[0] / (SECONDS_IN_MINUTE * MINUTES_IN_HOUR)
 
-        self._evaluate_probabilities(
+        fixed_probabilities = np.empty((len(self.fixed_thresholds), ) + forecast_cube.data.shape)
+        self._evaluate_fixed_probabilities(
+            input_dataset,
+            lead_time_hours,
+            fixed_probabilities,
+        )
+
+        error_probabilities = np.empty((len(self.error_thresholds), ) + forecast_cube.data.shape)
+        self._evaluate_error_probabilities(
             forecast_data,
             input_dataset,
             lead_time_hours,
-            forecast_cube.name(),
-            forecast_cube.units,
-            threshold_probability_cube.data,
+            error_probabilities,
         )
 
+        # add forecast to error thresholds
+        new_axes = [x + 1 for x in range(len(forecast_cube.data.shape))]
+        error_thresholds = np.expand_dims(self.error_thresholds, new_axes)
+        relative_forecast_thresholds = error_thresholds + np.expand_dims(forecast_data, 0)
+        # Add an extra threshold above withzero probability to
+        # ensure that the PDF covers the full probability range.
+        # Thresholds are usually float32 with epsilon of ~= 1.1e-7
+        eps = np.finfo(relative_forecast_thresholds.dtype).eps
+        # new threshold is the next representable float number.
+        relative_forecast_thresholds = np.concatenate(
+            [
+                relative_forecast_thresholds,
+                relative_forecast_thresholds[[-1]] + np.maximum(eps, np.abs(relative_forecast_thresholds[[-1]] * eps)),
+            ],
+            axis=0,
+        )
+        error_probabilities = np.concatenate(
+            [
+                error_probabilities,
+                np.zeros((1,) + error_probabilities.shape[1:], np.float32),
+            ],
+            axis=0,
+            dtype=np.float32,
+        )
+
+        # replace thresholds <= max fixed threshold with 0 (since the corresponding probabilities 
+        # have been set to 1 in _evaluate_error_probabilities)
+        max_fixed_threshold = max(self.fixed_thresholds)
+        relative_forecast_thresholds = np.where(relative_forecast_thresholds <= max_fixed_threshold, 0, relative_forecast_thresholds)
+
+        # broadcast the fixed thresholds to the correct shape
+        fixed_thresholds = np.expand_dims(self.fixed_thresholds, new_axes)
+        fixed_thresholds = np.broadcast_to(fixed_thresholds, (len(fixed_thresholds), ) + forecast_data.shape)
+
+        # combine fixed and error probabilities and sort
+        comb_probabilities = np.concatenate([fixed_probabilities, error_probabilities], axis=0)
+        comb_thresholds = np.concatenate([fixed_thresholds, error_thresholds], axis=0)
+        sort_ind = np.argsort(comb_thresholds, axis=0)
+        comb_thresholds = np.take_along_axis(comb_thresholds, sort_ind, axis=0)
+        comb_probabilities = np.take_along_axis(comb_probabilities, sort_ind, axis=0)
+
+        # interpolate
+        interp_probabilities = interpolate_pointwise(output_thresholds, comb_thresholds, comb_probabilities)
+
         # Enforcing monotonicity
-        threshold_probability_cube.data = self._make_decreasing(threshold_probability_cube.data)
+        threshold_probability_cube.data = self._make_decreasing(interp_probabilities)
 
         return threshold_probability_cube
 
-    def _get_ensemble_distributions(
-        self, probability_CDF: Cube, forecast: Cube, output_thresholds: List[float]
-    ) -> Cube:
-        """
-        Interpolate probilities calculated at model thresholds to extract probabilities at output thresholds
-        for all realizations.
-
-        Args:
-            probability_CDF:
-                Cube containing the CDF of probabilities for each enemble member at model
-                threhsolds.
-            forecast:
-                Cube containing NWP ensemble forecast.
-            output_thresholds:
-                Ordered list of thresholds at which to calculate the output probabilities.
-
-        Returns:
-            Cube containing probabilities at output thresholds for all realizations. Dimensions
-            are same as forecast cube with additional threshold dimension first.
-        """
-
-        input_probabilties = probability_CDF.data
-        input_probabilties = self._make_decreasing(input_probabilties)
-        if (len(self.model_thresholds) == len(output_thresholds)) and np.allclose(self.model_thresholds, output_thresholds):
-            output_probabilities = input_probabilties.data
-        else:
-            input_probabilties = np.concatenate([np.ones((1,) + input_probabilties.shape[1:]), input_probabilties], axis=0)
-            input_thresholds = np.concatenate([[0], self.model_thresholds])
-            # reshape to 2 dimensions
-            input_probabilties_2d = np.reshape(input_probabilties, (input_probabilties.shape[0], -1))
-            output_probabilities_2d = interpolate_multiple_rows_same_x(output_thresholds, input_thresholds, input_probabilties_2d.transpose())
-            output_probabilities = np.reshape(output_probabilities_2d.transpose(), (len(output_thresholds), ) + input_probabilties.shape[1:])
-
-        # set probability for zero threshold to 1
-        output_probabilities[0, :] = 1
-
-        # Make output cube
-        aux_coords_and_dims = []
-        for coord in getattr(forecast, "aux_coords"):
-            coord_dims = forecast.coord_dims(coord)
-            if len(coord_dims) == 0:
-                aux_coords_and_dims.append((coord.copy(), []))
-            else:
-                aux_coords_and_dims.append(
-                    (coord.copy(), forecast.coord_dims(coord)[0] + 1)
-                )
-        forecast_variable = forecast.name()
-        threshold_dim = iris.coords.DimCoord(
-            output_thresholds.astype(np.float32),
-            standard_name=forecast_variable,
-            units=forecast.units,
-            var_name="threshold",
-            attributes={"spp__relative_to_threshold": "greater_than_or_equal_to"},
-        )
-        dim_coords_and_dims = [(threshold_dim, 0)] + [
-            (coord.copy(), forecast.coord_dims(coord)[0] + 1)
-            for coord in forecast.coords(dim_coords=True)
-        ]
-        probability_cube = iris.cube.Cube(
-            output_probabilities.astype(np.float32),
-            long_name=f"probability_of_{forecast_variable}_above_threshold",
-            units=1,
-            attributes=forecast.attributes,
-            dim_coords_and_dims=dim_coords_and_dims,
-            aux_coords_and_dims=aux_coords_and_dims,
-        )
-        return probability_cube
 
     def process(
         self, forecast_cube: Cube, feature_cubes: CubeList, output_thresholds: List,
@@ -601,14 +632,9 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             feature_cubes, forecast_cube
         )
 
-        # Evaluate the CDF using tree models.
-        probability_CDF = self._calculate_threshold_probabilities(
-            aligned_forecast, aligned_features
-        )
-
         # Calculate probabilities at output thresholds
-        probabilities_by_realization = self._get_ensemble_distributions(
-            probability_CDF, aligned_forecast, output_thresholds
+        probabilities_by_realization = self._calculate_threshold_probabilities(
+            aligned_forecast, aligned_features, output_thresholds
         )
 
         # Average over realizations
@@ -669,24 +695,31 @@ class ApplyRainForestsCalibrationTreelite(ApplyRainForestsCalibrationLightGBM):
         """
         from treelite_runtime import DMatrix, Predictor
 
-        # Model config is a nested dictionary. Keys of outer level are lead times, and
-        # keys of inner level are thresholds. Convert these to int and float.
+        # Model config is a nested dictionary. Levels are lead time, threshold type, and threshold.
+        # Convert lead times to int and thresholds to float.
         sorted_model_config_dict = OrderedDict()
         for lead_time_key in sorted(list(model_config_dict.keys())):
             sorted_model_config_dict[int(lead_time_key)] = OrderedDict()
-            lead_time_dict = model_config_dict[lead_time_key]
-            sorted_model_config_dict[int(lead_time_key)] = OrderedDict(
-                sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
-            )
+            for threshold_type in ["fixed", "error"]:
+                sorted_model_config_dict[int(lead_time_key)][threshold_type] = OrderedDict()
+                lead_time_dict = model_config_dict[lead_time_key][threshold_type]
+                sorted_model_config_dict[int(lead_time_key)][threshold_type]  = OrderedDict(
+                    sorted({np.float32(k): v for k, v in lead_time_dict.items()}.items())
+                )
 
         self.lead_times = np.array([*sorted_model_config_dict.keys()])
-        self.model_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]].keys()])
-        self.model_input_converter = DMatrix
+        self.fixed_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["fixed"].keys()])
+        self.error_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["error"].keys()])
+        self.model_input_converter = np.array
         self.tree_models = {}
         for lead_time in self.lead_times:
-            for threshold in self.model_thresholds:
-                model_filename = Path(sorted_model_config_dict[lead_time][threshold].get("treelite_model")).expanduser()
-                self.tree_models[lead_time, threshold] = Predictor(libpath=str(model_filename), verbose=False, nthread=threads)
+            for threshold_type in ["fixed", "error"]:
+                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else "error"
+                for threshold in threshold_list:
+                    model_filename = Path(sorted_model_config_dict[lead_time][threshold_type][threshold].get("treelite_model")).expanduser()
+                    self.tree_models[lead_time, threshold_type, threshold] = Predictor(libpath=str(model_filename), verbose=False, nthread=threads)
+
+
 
     def _check_num_features(self, features: CubeList) -> None:
         """Check that the correct number of features has been passed into the model.
