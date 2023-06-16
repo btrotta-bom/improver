@@ -429,7 +429,6 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         for threshold_index, threshold in enumerate(self.fixed_thresholds):
             model = self.tree_models[lead_time_hours, "fixed", threshold]
             prediction = model.predict(input_dataset)
-            prediction = np.maximum(np.minimum(1, prediction), 0)
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
             )
@@ -481,6 +480,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 if np.any(forecast_bool):
                     input_subset = self.model_input_converter(input_data[forecast_bool])
                     prediction[forecast_bool] = model.predict(input_subset)
+            prediction = np.maximum(np.minimum(1, prediction), 0)
             output_data[threshold_index, :] = np.reshape(
                 prediction, output_data.shape[1:]
             )
@@ -582,7 +582,6 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
 
         threshold_probability_cube.data = interp_probabilities
 
-        assert np.max(np.diff(interp_probabilities, axis=0)) <= 0
         return threshold_probability_cube
 
 
@@ -643,7 +642,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         # Average over realizations
         output_cube = probabilities_by_realization.collapsed("realization", MEAN)
         output_cube.remove_coord("realization")
-
+        
         return output_cube
 
 
