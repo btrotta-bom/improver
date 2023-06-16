@@ -209,7 +209,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         self.tree_models = {}
         for lead_time in self.lead_times:
             for threshold_type in ["fixed", "error"]:
-                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else "error"
+                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else self.error_thresholds
                 for threshold in threshold_list:
                     model_filename = Path(sorted_model_config_dict[lead_time][threshold_type][threshold].get("lightgbm_model")).expanduser()
                     self.tree_models[lead_time, threshold_type, threshold] = Booster(model_file=str(model_filename)).reset_parameter({"num_threads": threads})
@@ -338,7 +338,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             mandatory_attributes=generate_mandatory_attributes([forecast_cube]),
         )
         threshold_coord = DimCoord(
-            output_thresholds,
+            output_thresholds.astype(np.float32),
             long_name=forecast_variable,
             var_name="threshold",
             units=forecast_cube.units,
@@ -470,14 +470,14 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             # it is assumed that models have been trained using the >= operator
             # (i.e. they predict the probabilty that error >= threshold)
             threshold = self.error_thresholds[threshold_index]
-            if threshold >= 0:
+            if threshold > max_fixed_threshold:
                 # In this case, for all values of forecast we have
-                # forecast + threshold >= forecast >= lower_bound_in_fcst_units
+                # forecast + threshold >= forecast > max_fixed_threshold
                 prediction = model.predict(input_dataset)
             else:
                 # Predict 1 where forecast + threshold > max_fixed_threshold
                 prediction = np.ones(input_data.shape[0], dtype=np.float32)
-                forecast_bool = forecast_data + threshold >= max_fixed_threshold
+                forecast_bool = forecast_data + threshold > max_fixed_threshold
                 if np.any(forecast_bool):
                     input_subset = self.model_input_converter(input_data[forecast_bool])
                     prediction[forecast_bool] = model.predict(input_subset)
@@ -511,21 +511,21 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
                 treelite_runtime Predictor (if treelite dependency is available).
         """
 
-        threshold_probability_cube = self._prepare_threshold_probability_cube(forecast_cube)
+        threshold_probability_cube = self._prepare_threshold_probability_cube(forecast_cube, output_thresholds)
 
         input_dataset = self._prepare_features_array(feature_cubes)
 
         forecast_data = forecast_cube.data.ravel()
         lead_time_hours = forecast_cube.coord("forecast_period").points[0] / (SECONDS_IN_MINUTE * MINUTES_IN_HOUR)
 
-        fixed_probabilities = np.empty((len(self.fixed_thresholds), ) + forecast_cube.data.shape)
+        fixed_probabilities = np.empty((len(self.fixed_thresholds), ) + forecast_cube.data.shape, dtype=np.float32)
         self._evaluate_fixed_probabilities(
             input_dataset,
             lead_time_hours,
             fixed_probabilities,
         )
 
-        error_probabilities = np.empty((len(self.error_thresholds), ) + forecast_cube.data.shape)
+        error_probabilities = np.empty((len(self.error_thresholds), ) + forecast_cube.data.shape, dtype=np.float32)
         self._evaluate_error_probabilities(
             forecast_data,
             input_dataset,
@@ -536,7 +536,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
         # add forecast to error thresholds
         new_axes = [x + 1 for x in range(len(forecast_cube.data.shape))]
         error_thresholds = np.expand_dims(self.error_thresholds, new_axes)
-        relative_forecast_thresholds = error_thresholds + np.expand_dims(forecast_data, 0)
+        relative_forecast_thresholds = error_thresholds + np.expand_dims(forecast_cube.data, 0)
         # Add an extra threshold above withzero probability to
         # ensure that the PDF covers the full probability range.
         # Thresholds are usually float32 with epsilon of ~= 1.1e-7
@@ -558,28 +558,31 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             dtype=np.float32,
         )
 
-        # replace thresholds <= max fixed threshold with 0 (since the corresponding probabilities 
+        # replace thresholds < max fixed threshold with 0 (since the corresponding probabilities 
         # have been set to 1 in _evaluate_error_probabilities)
         max_fixed_threshold = max(self.fixed_thresholds)
-        relative_forecast_thresholds = np.where(relative_forecast_thresholds <= max_fixed_threshold, 0, relative_forecast_thresholds)
+        relative_forecast_thresholds = np.where(relative_forecast_thresholds < max_fixed_threshold, 0, relative_forecast_thresholds)
 
         # broadcast the fixed thresholds to the correct shape
         fixed_thresholds = np.expand_dims(self.fixed_thresholds, new_axes)
-        fixed_thresholds = np.broadcast_to(fixed_thresholds, (len(fixed_thresholds), ) + forecast_data.shape)
+        fixed_thresholds = np.broadcast_to(fixed_thresholds, (len(self.fixed_thresholds), ) + forecast_cube.data.shape)
 
         # combine fixed and error probabilities and sort
         comb_probabilities = np.concatenate([fixed_probabilities, error_probabilities], axis=0)
-        comb_thresholds = np.concatenate([fixed_thresholds, error_thresholds], axis=0)
+        comb_thresholds = np.concatenate([fixed_thresholds, relative_forecast_thresholds], axis=0)
         sort_ind = np.argsort(comb_thresholds, axis=0)
         comb_thresholds = np.take_along_axis(comb_thresholds, sort_ind, axis=0)
         comb_probabilities = np.take_along_axis(comb_probabilities, sort_ind, axis=0)
+ 
+        # Enforcing monotonicity
+        comb_probabilities = self._make_decreasing(comb_probabilities)       
 
         # interpolate
-        interp_probabilities = interpolate_pointwise(output_thresholds, comb_thresholds, comb_probabilities)
+        interp_probabilities = 1 - interpolate_pointwise(output_thresholds, comb_thresholds, 1 - comb_probabilities)
 
-        # Enforcing monotonicity
-        threshold_probability_cube.data = self._make_decreasing(interp_probabilities)
+        threshold_probability_cube.data = interp_probabilities
 
+        assert np.max(np.diff(interp_probabilities, axis=0)) <= 0
         return threshold_probability_cube
 
 
@@ -710,11 +713,11 @@ class ApplyRainForestsCalibrationTreelite(ApplyRainForestsCalibrationLightGBM):
         self.lead_times = np.array([*sorted_model_config_dict.keys()])
         self.fixed_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["fixed"].keys()])
         self.error_thresholds = np.array([*sorted_model_config_dict[self.lead_times[0]]["error"].keys()])
-        self.model_input_converter = np.array
+        self.model_input_converter = DMatrix
         self.tree_models = {}
         for lead_time in self.lead_times:
             for threshold_type in ["fixed", "error"]:
-                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else "error"
+                threshold_list = self.fixed_thresholds if threshold_type == "fixed" else self.error_thresholds
                 for threshold in threshold_list:
                     model_filename = Path(sorted_model_config_dict[lead_time][threshold_type][threshold].get("treelite_model")).expanduser()
                     self.tree_models[lead_time, threshold_type, threshold] = Predictor(libpath=str(model_filename), verbose=False, nthread=threads)
