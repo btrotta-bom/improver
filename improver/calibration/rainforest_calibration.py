@@ -342,7 +342,7 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             long_name=forecast_variable,
             var_name="threshold",
             units=forecast_cube.units,
-            attributes={"spp__relative_to_threshold": "above"},
+            attributes={"spp__relative_to_threshold": "greater_than_or_equal_to"},
         )
         probability_cube = add_coordinate_to_cube(
             probability_cube, new_coord=threshold_coord,
@@ -558,10 +558,10 @@ class ApplyRainForestsCalibrationLightGBM(ApplyRainForestsCalibration):
             dtype=np.float32,
         )
 
-        # replace thresholds < max fixed threshold with 0 (since the corresponding probabilities 
+        # replace thresholds <= max fixed threshold with 0 (since the corresponding probabilities 
         # have been set to 1 in _evaluate_error_probabilities)
         max_fixed_threshold = max(self.fixed_thresholds)
-        relative_forecast_thresholds = np.where(relative_forecast_thresholds < max_fixed_threshold, 0, relative_forecast_thresholds)
+        relative_forecast_thresholds = np.where(relative_forecast_thresholds <= max_fixed_threshold, 0, relative_forecast_thresholds)
 
         # broadcast the fixed thresholds to the correct shape
         fixed_thresholds = np.expand_dims(self.fixed_thresholds, new_axes)
