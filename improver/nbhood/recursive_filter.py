@@ -20,6 +20,122 @@ from improver.utilities.cube_checker import check_cube_coordinates
 from improver.utilities.pad_spatial import pad_cube_with_halo, remove_halo_from_cube
 
 
+def njit_if_available():
+    """Return the njit decorator if numba is available,
+    otherwise return the identity function."""
+    try:
+        import numba
+
+        return numba.njit
+    except:
+        Warning("Numba is not available, calculation of recursive filter will be slow.")
+        return lambda fun: fun
+
+
+@njit_if_available()
+def recurse_forward(grid: ndarray, smoothing_coefficients: ndarray, axis: int):
+    """
+    Method to run the recursive filter in the forward direction.
+    Modifies grid in-place.
+
+    In the forward direction:
+        Recursive filtering is calculated as:
+
+    .. math::
+        B_i = ((1 - \\rm{smoothing\\_coefficient_{i-1}}) \\times A_i) +
+        (\\rm{smoothing\\_coefficient_{i-1}} \\times B_{i-1})
+
+    Progressing from gridpoint i-1 to i:
+        :math:`B_i` = new value at gridpoint i
+
+        :math:`A_i` = Old value at gridpoint i
+
+        :math:`B_{i-1}` = New value at gridpoint i - 1
+
+    Args:
+        grid:
+            2D array containing the input data to which the recursive
+            filter will be applied.
+        smoothing_coefficients:
+            Matching 2D array of smoothing_coefficient values that will be
+            used when applying the recursive filter along the specified
+            axis.
+        axis:
+            Index of the spatial axis (0 or 1) over which to recurse.
+    """
+
+    lim = grid.shape[axis]
+    for i in range(1, lim):
+        if axis == 0:
+            grid[i, :] = (1.0 - smoothing_coefficients[i - 1, :]) * grid[
+                i, :
+            ] + smoothing_coefficients[i - 1, :] * grid[i - 1, :]
+        if axis == 1:
+            grid[:, i] = (1.0 - smoothing_coefficients[:, i - 1]) * grid[
+                :, i
+            ] + smoothing_coefficients[:, i - 1] * grid[:, i - 1]
+
+
+@njit_if_available()
+def recurse_backward(grid: ndarray, smoothing_coefficients: ndarray, axis: int):
+    """
+    Method to run the recursive filter in the backwards direction. Modifies grid 
+    in place
+
+    In the backwards direction:
+        Recursive filtering is calculated as:
+
+    .. math::
+        B_i = ((1 - \\rm{smoothing\\_coefficient}) \\times A_i) +
+        (\\rm{smoothing\\_coefficient} \\times B_{i+1})
+
+    Progressing from gridpoint i+1 to i:
+        :math:`B_i` = new value at gridpoint i
+
+        :math:`A_i` = Old value at gridpoint i
+
+        :math:`B_{i+1}` = New value at gridpoint i+1
+
+    Args:
+        grid:
+            2D array containing the input data to which the recursive
+            filter will be applied.
+        smoothing_coefficients:
+            Matching 2D array of smoothing_coefficient values that will be
+            used when applying the recursive filter along the specified
+            axis.
+        axis:
+            Index of the spatial axis (0 or 1) over which to recurse.
+    """
+    lim = grid.shape[axis]
+    for i in range(lim - 2, -1, -1):
+        if axis == 0:
+            grid[i, :] = (1.0 - smoothing_coefficients[i, :]) * grid[
+                i, :
+            ] + smoothing_coefficients[i, :] * grid[i + 1, :]
+        if axis == 1:
+            grid[:, i] = (1.0 - smoothing_coefficients[:, i]) * grid[
+                :, i
+            ] + smoothing_coefficients[:, i] * grid[:, i + 1]
+
+
+@njit_if_available()
+def run_recursion_on_array(
+    x_data: ndarray,
+    x_index: int,
+    y_data: ndarray,
+    y_index: int,
+    iterations: int,
+    output: ndarray,
+):
+    """Run recursive filter, modifying output in-place."""
+    for _ in range(iterations):
+        recurse_forward(output, x_data, x_index)
+        recurse_backward(output, x_data, x_index)
+        recurse_forward(output, y_data, y_index)
+        recurse_backward(output, y_data, y_index)
+
+
 class RecursiveFilter(PostProcessingPlugin):
     """
     Apply a recursive filter to the input cube.
@@ -49,104 +165,6 @@ class RecursiveFilter(PostProcessingPlugin):
         self.smoothing_coefficient_name_format = "smoothing_coefficient_{}"
 
     @staticmethod
-    def _recurse_forward(
-        grid: ndarray, smoothing_coefficients: ndarray, axis: int
-    ) -> ndarray:
-        """
-        Method to run the recursive filter in the forward direction.
-
-        In the forward direction:
-            Recursive filtering is calculated as:
-
-        .. math::
-            B_i = ((1 - \\rm{smoothing\\_coefficient_{i-1}}) \\times A_i) +
-            (\\rm{smoothing\\_coefficient_{i-1}} \\times B_{i-1})
-
-        Progressing from gridpoint i-1 to i:
-            :math:`B_i` = new value at gridpoint i
-
-            :math:`A_i` = Old value at gridpoint i
-
-            :math:`B_{i-1}` = New value at gridpoint i - 1
-
-        Args:
-            grid:
-                2D array containing the input data to which the recursive
-                filter will be applied.
-            smoothing_coefficients:
-                Matching 2D array of smoothing_coefficient values that will be
-                used when applying the recursive filter along the specified
-                axis.
-            axis:
-                Index of the spatial axis (0 or 1) over which to recurse.
-
-        Returns:
-            2D array containing the smoothed field after the recursive
-            filter method has been applied to the input array in the
-            forward direction along the specified axis.
-        """
-        lim = grid.shape[axis]
-        for i in range(1, lim):
-            if axis == 0:
-                grid[i, :] = (1.0 - smoothing_coefficients[i - 1, :]) * grid[
-                    i, :
-                ] + smoothing_coefficients[i - 1, :] * grid[i - 1, :]
-            if axis == 1:
-                grid[:, i] = (1.0 - smoothing_coefficients[:, i - 1]) * grid[
-                    :, i
-                ] + smoothing_coefficients[:, i - 1] * grid[:, i - 1]
-        return grid
-
-    @staticmethod
-    def _recurse_backward(
-        grid: ndarray, smoothing_coefficients: ndarray, axis: int
-    ) -> ndarray:
-        """
-        Method to run the recursive filter in the backwards direction.
-
-        In the backwards direction:
-            Recursive filtering is calculated as:
-
-        .. math::
-            B_i = ((1 - \\rm{smoothing\\_coefficient}) \\times A_i) +
-            (\\rm{smoothing\\_coefficient} \\times B_{i+1})
-
-        Progressing from gridpoint i+1 to i:
-            :math:`B_i` = new value at gridpoint i
-
-            :math:`A_i` = Old value at gridpoint i
-
-            :math:`B_{i+1}` = New value at gridpoint i+1
-
-        Args:
-            grid:
-                2D array containing the input data to which the recursive
-                filter will be applied.
-            smoothing_coefficients:
-                Matching 2D array of smoothing_coefficient values that will be
-                used when applying the recursive filter along the specified
-                axis.
-            axis:
-                Index of the spatial axis (0 or 1) over which to recurse.
-
-        Returns:
-            2D array containing the smoothed field after the recursive
-            filter method has been applied to the input array in the
-            backwards direction along the specified axis.
-        """
-        lim = grid.shape[axis]
-        for i in range(lim - 2, -1, -1):
-            if axis == 0:
-                grid[i, :] = (1.0 - smoothing_coefficients[i, :]) * grid[
-                    i, :
-                ] + smoothing_coefficients[i, :] * grid[i + 1, :]
-            if axis == 1:
-                grid[:, i] = (1.0 - smoothing_coefficients[:, i]) * grid[
-                    :, i
-                ] + smoothing_coefficients[:, i] * grid[:, i + 1]
-        return grid
-
-    @staticmethod
     def _run_recursion(
         cube: Cube,
         smoothing_coefficients_x: Cube,
@@ -154,8 +172,7 @@ class RecursiveFilter(PostProcessingPlugin):
         iterations: int,
     ) -> Cube:
         """
-        Method to run the recursive filter.
-
+        Method to run the recursive filter. Uses faster numba version if available.
         Args:
             cube:
                 2D cube containing the input data to which the recursive
@@ -178,21 +195,15 @@ class RecursiveFilter(PostProcessingPlugin):
         (x_index,) = cube.coord_dims(cube.coord(axis="x").name())
         (y_index,) = cube.coord_dims(cube.coord(axis="y").name())
         output = cube.data
-
-        for _ in range(iterations):
-            output = RecursiveFilter._recurse_forward(
-                output, smoothing_coefficients_x.data, x_index
-            )
-            output = RecursiveFilter._recurse_backward(
-                output, smoothing_coefficients_x.data, x_index
-            )
-            output = RecursiveFilter._recurse_forward(
-                output, smoothing_coefficients_y.data, y_index
-            )
-            output = RecursiveFilter._recurse_backward(
-                output, smoothing_coefficients_y.data, y_index
-            )
-            cube.data = output
+        run_recursion_on_array(
+            smoothing_coefficients_x.data,
+            x_index,
+            smoothing_coefficients_y.data,
+            y_index,
+            iterations,
+            output,
+        )
+        cube.data = output
         return cube
 
     def _validate_coefficients(

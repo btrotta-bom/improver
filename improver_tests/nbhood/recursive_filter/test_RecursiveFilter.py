@@ -6,13 +6,20 @@
 
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 import iris
 import numpy as np
 from iris.cube import Cube
 from iris.tests import IrisTest
 
-from improver.nbhood.recursive_filter import RecursiveFilter
+from improver.nbhood.recursive_filter import (
+    RecursiveFilter,
+    njit_if_available,
+    recurse_backward,
+    recurse_forward,
+    run_recursion_on_array,
+)
 from improver.synthetic_data.set_up_test_cubes import (
     add_coordinate,
     set_up_variable_cube,
@@ -274,12 +281,12 @@ class Test__pad_coefficients(Test_RecursiveFilter):
         self.assertEqual(result.shape, expected_shape)
 
 
-class Test__recurse_forward(Test_RecursiveFilter):
+class Test_recurse_forward(Test_RecursiveFilter):
 
-    """Test the _recurse_forward method"""
+    """Test the recurse_forward method"""
 
     def test_first_axis(self):
-        """Test that the returned _recurse_forward array has the expected
+        """Test that the modified recurse_forward array has the expected
            type and result."""
         expected_result = np.array(
             [
@@ -290,14 +297,13 @@ class Test__recurse_forward(Test_RecursiveFilter):
                 [0.0125, 0.03125, 0.196875, 0.03125, 0.0125],
             ]
         )
-        result = RecursiveFilter(edge_width=1)._recurse_forward(
-            self.cube.data[0, :], self.smoothing_coefficients[1].data, 0
-        )
-        self.assertIsInstance(result, np.ndarray)
-        self.assertArrayAlmostEqual(result, expected_result)
+        grid = self.cube.data[0, :]
+        recurse_forward(grid, self.smoothing_coefficients[1].data, 0)
+        self.assertIsInstance(grid, np.ndarray)
+        self.assertArrayAlmostEqual(grid, expected_result)
 
     def test_second_axis(self):
-        """Test that the returned _recurse_forward array has the expected
+        """Test that the modified recurse_forward array has the expected
            type and result."""
         expected_result = np.array(
             [
@@ -308,19 +314,18 @@ class Test__recurse_forward(Test_RecursiveFilter):
                 [0.0, 0.000, 0.0500, 0.02500, 0.012500],
             ]
         )
-        result = RecursiveFilter(edge_width=1)._recurse_forward(
-            self.cube.data[0, :], self.smoothing_coefficients[0].data, 1
-        )
-        self.assertIsInstance(result, np.ndarray)
-        self.assertArrayAlmostEqual(result, expected_result)
+        grid = self.cube.data[0, :]
+        recurse_forward(grid, self.smoothing_coefficients[0].data, 1)
+        self.assertIsInstance(grid, np.ndarray)
+        self.assertArrayAlmostEqual(grid, expected_result)
 
 
-class Test__recurse_backward(Test_RecursiveFilter):
+class Test_recurse_backward(Test_RecursiveFilter):
 
-    """Test the _recurse_backward method"""
+    """Test the recurse_backward method"""
 
     def test_first_axis(self):
-        """Test that the returned _recurse_backward array has the expected
+        """Test that the modified recurse_backward array has the expected
            type and result."""
         expected_result = np.array(
             [
@@ -331,14 +336,13 @@ class Test__recurse_backward(Test_RecursiveFilter):
                 [0.0000, 0.00000, 0.100000, 0.00000, 0.0000],
             ]
         )
-        result = RecursiveFilter(edge_width=1)._recurse_backward(
-            self.cube.data[0, :], self.smoothing_coefficients[1].data, 0
-        )
-        self.assertIsInstance(result, np.ndarray)
-        self.assertArrayAlmostEqual(result, expected_result)
+        grid = self.cube.data[0, :]
+        recurse_backward(grid, self.smoothing_coefficients[1].data, 0)
+        self.assertIsInstance(grid, np.ndarray)
+        self.assertArrayAlmostEqual(grid, expected_result)
 
     def test_second_axis(self):
-        """Test that the returned _recurse_backward array has the expected
+        """Test that the modified recurse_backward array has the expected
            type and result."""
         expected_result = np.array(
             [
@@ -349,11 +353,10 @@ class Test__recurse_backward(Test_RecursiveFilter):
                 [0.012500, 0.02500, 0.0500, 0.000, 0.0],
             ]
         )
-        result = RecursiveFilter(edge_width=1)._recurse_backward(
-            self.cube.data[0, :], self.smoothing_coefficients[0].data, 1
-        )
-        self.assertIsInstance(result, np.ndarray)
-        self.assertArrayAlmostEqual(result, expected_result)
+        grid = self.cube.data[0, :]
+        recurse_backward(grid, self.smoothing_coefficients[0].data, 1)
+        self.assertIsInstance(grid, np.ndarray)
+        self.assertArrayAlmostEqual(grid, expected_result)
 
 
 class Test__run_recursion(Test_RecursiveFilter):
@@ -462,7 +465,7 @@ class Test_process(Test_RecursiveFilter):
 
     def test_smoothing_coefficient_cubes_masked_data(self):
         """Test that the RecursiveFilter plugin returns the correct data
-        when a masked data cube.
+        when processing a masked data cube.
         """
         plugin = RecursiveFilter(iterations=self.iterations,)
         mask = np.zeros(self.cube.data.shape)
@@ -472,6 +475,38 @@ class Test_process(Test_RecursiveFilter):
         expected = 0.184375
         self.assertAlmostEqual(result.data[0][2][2], expected)
         self.assertArrayEqual(result.data.mask, mask)
+        from improver.nbhood.recursive_filter import (
+            recurse_backward,
+            recurse_forward,
+            run_recursion_on_array,
+        )
+
+        # check that numba version is loaded
+        for fun in [recurse_forward, recurse_backward, run_recursion_on_array]:
+            assert "CPUDispatcher" in fun.__str__()
+        # test non-numba version returns same result, since numba does
+        # not support masked arrays
+        with patch.dict("sys.modules", numba=None):
+            import importlib
+
+            from improver.nbhood import recursive_filter
+
+            importlib.reload(recursive_filter)
+            from improver.nbhood.recursive_filter import (
+                recurse_backward,
+                recurse_forward,
+                run_recursion_on_array,
+            )
+
+            plugin = RecursiveFilter(iterations=self.iterations,)
+            # check that non-numba version is loaded
+            for fun in [recurse_forward, recurse_backward, run_recursion_on_array]:
+                assert "CPUDispatcher" not in fun.__str__()
+            result = plugin(
+                self.cube, smoothing_coefficients=self.smoothing_coefficients
+            )
+            self.assertAlmostEqual(result.data[0][2][2], expected)
+            self.assertArrayEqual(result.data.mask, mask)
 
     def test_coordinate_reordering_with_different_smoothing_coefficients(self):
         """Test that x and y smoothing_coefficients still apply to the right
