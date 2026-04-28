@@ -102,13 +102,17 @@ class BetaRecalibrate(PostProcessingPlugin):
         fps_string = list(self.recalibration_dict["forecast_period"].keys())
         curr_thresholds = None
         thresholds = sorted(
-            list(self.recalibration_dict["forecast_period"][fp[0]]["thresholds"].keys())
+            list(
+                self.recalibration_dict["forecast_period"][fps_string[0]][
+                    "threshold"
+                ].keys()
+            )
         )
         for fp_string in fps_string[1:]:
             curr_thresholds = sorted(
                 list(
-                    self.recalibration_dict["forecast_period"][fp[0]][
-                        "thresholds"
+                    self.recalibration_dict["forecast_period"][fp_string][
+                        "threshold"
                     ].keys()
                 )
             )
@@ -125,31 +129,33 @@ class BetaRecalibrate(PostProcessingPlugin):
         alpha_arr = []
         beta_arr = []
         for fp_string in fps_string:
+            fp_dict = self.recalibration_dict["forecast_period"][fp_string]
             # interpolate thresholds to cube thresholds
             recal_thresholds = []
             curr_alpha_arr = []
             curr_beta_arr = []
-            for t_string in recalibration_dict[fp_string]:
+            for t_string in fp_dict["threshold"]:
                 t = float(t_string)
                 if "threshold_units" in self.recalibration_dict.keys():
                     # convert threshold points to cube units
                     units = cf_units.Unit(self.recalibration_dict["threshold_units"])
                     t = units.convert(t, cube.coord(threshold_coord_name).units)
                 recal_thresholds.append(t)
-                curr_alpha_arr.append(
-                    self.recalibration_dict[fp_string][t_string]["alpha"]
-                )
-                curr_beta_arr.append(
-                    self.recalibration_dict[fp_string][t_string]["beta"]
-                )
-
+                curr_alpha_arr.append(fp_dict["threshold"][t_string]["alpha"])
+                curr_beta_arr.append(fp_dict["threshold"][t_string]["beta"])
+            curr_alpha_arr = np.array(curr_alpha_arr)
+            curr_beta_arr = np.array(curr_beta_arr)
+            if np.any(curr_alpha_arr <= 0) or np.any(curr_beta_arr <= 0):
+                raise RuntimeError("alpha and beta parameters must be > 0")
             # sort alpha and beta by threshold and interpolate to cube thresholds
             sort_ind = np.argsort(recal_thresholds)
             alpha_arr.append(
-                np.interp(cube_thresholds, thresholds, curr_alpha_arr[sort_ind])
+                np.interp(
+                    cube_thresholds, thresholds, np.take(curr_alpha_arr, sort_ind)
+                )
             )
             beta_arr.append(
-                np.interp(cube_thresholds, thresholds, curr_beta_arr[sort_ind])
+                np.interp(cube_thresholds, thresholds, np.take(curr_beta_arr, sort_ind))
             )
 
         # stack alpha and beta arrays in order of forecast period
@@ -158,35 +164,39 @@ class BetaRecalibrate(PostProcessingPlugin):
             units = cf_units.Unit(self.recalibration_dict["forecast_period_units"])
             fps = [units.convert(fp, cube.coord("forecast_period").units) for fp in fps]
         sort_ind = np.argsort(fps)
-        fps = fps[sort_ind]
-        alpha_arr = np.vstack(alpha_arr[sort_ind])
-        beta_arr = np.vstack(beta_arr[sort_ind])
+        fps = np.take(fps, sort_ind)
+        alpha_arr = np.vstack([alpha_arr[i] for i in sort_ind])
+        beta_arr = np.vstack([beta_arr[i] for i in sort_ind])
 
         # interpolate to cube forecast periods
+        cube_forecast_period = cube.coord("forecast_period").points
         alpha_arr = np.hstack(
             [
-                np.interp(cube_forecast_period, fps, alpha_arr[:, [i]])
+                np.interp(cube_forecast_period, fps, alpha_arr[:, i])[:, np.newaxis]
                 for i in range(alpha_arr.shape[1])
             ]
         )
         beta_arr = np.hstack(
             [
-                np.interp(cube_forecast_period, fps, beta_arr[:, [i]])
+                np.interp(cube_forecast_period, fps, beta_arr[:, i])[:, np.newaxis]
                 for i in range(beta_arr.shape[1])
             ]
         )
-        if np.any(alpha_arr <= 0) or np.any(beta_arr <= 0):
-            raise RuntimeError("interpolated alpha and beta parameters must be > 0")
-
         # nested slicing so we guarantee the order of slices
         cubelist = iris.cube.CubeList([])
         for i, fp_slice in enumerate(cube.slices_over("forecast_period")):
-            for j, t_slice in fp_slice.slices_over(threshold_coord_name):
+            for j, t_slice in enumerate(fp_slice.slices_over(threshold_coord_name)):
                 t_slice.data = (
                     beta(alpha_arr[i][j], beta_arr[i][j])
                     .cdf(t_slice.data)
                     .astype(np.float32)
                 )
                 cubelist.append(t_slice)
+        output_cube = cubelist.merge_cube()
 
-        return cubelist.merge_cube()
+        # transpose so dimensions are in same order as original
+        original_dims = [c.name() for c in cube.dim_coords]
+        new_dims = [c.name() for c in output_cube.dim_coords]
+        sort_ind = [new_dims.index(x) for x in original_dims]
+        output_cube.transpose(sort_ind)
+        return output_cube

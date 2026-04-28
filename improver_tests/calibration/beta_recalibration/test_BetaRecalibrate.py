@@ -26,13 +26,13 @@ def forecast_grid():
     forecast_1 = set_up_probability_cube(
         forecast_data_stack,
         thresholds,
-        time=datetime(2017, 11, 11, 4, 0),
+        time=datetime(2017, 11, 11, 2, 0),
         frt=datetime(2017, 11, 11, 0, 0),
     )
     forecast_2 = set_up_probability_cube(
         forecast_data_stack,
         thresholds,
-        time=datetime(2017, 11, 11, 8, 0),
+        time=datetime(2017, 11, 11, 6, 0),
         frt=datetime(2017, 11, 11, 0, 0),
     )
     forecasts_grid = MergeCubes()([forecast_1, forecast_2])
@@ -60,10 +60,10 @@ def percentile_forecast_grid():
 def recalibration_dict():
     recal_dict = {
         "forecast_period": {
-            "0": {"threshold": {"273.0": {"alpha": 0, "beta": 1}}},
-            "1": {"threshold": {"273.0": {"alpha": 1, "beta": 2}}},
+            "0": {"threshold": {"273.0": {"alpha": 1, "beta": 1}}},
+            "4": {"threshold": {"273.0": {"alpha": 1, "beta": 2}}},
         },
-        "forecast_units": "hours",
+        "forecast_period_units": "hours",
         "threshold_units": "K",
     }
     return recal_dict
@@ -87,53 +87,97 @@ def test_no_forecast_period_coord(forecast_grid, recalibration_dict):
         plugin.process(forecast_grid.copy())
 
 
-def test_invalid_params(forecast_grid, recalibration_dict):
+def test_invalid_params(forecast_grid):
     # test that error is raised when alpha or beta parameter is invalid
-    msg = "interpolated alpha and beta parameters must be > 0"
+    msg = "alpha and beta parameters must be > 0"
     recal_dict = {
         "forecast_period": {
             "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}}},
-            "1": {"threshold": {"273.0": {"alpha": 0, "beta": 1}}},
+            "1": {"threshold": {"273.0": {"alpha": -1, "beta": 1}}},
         },
-        "forecast_units": "hours",
+        "forecast_period_units": "hours",
         "threshold_units": "K",
     }
-    plugin = BetaRecalibrate(recalibration_dict)
+    plugin = BetaRecalibrate(recal_dict)
     with pytest.raises(RuntimeError, match=msg):
         plugin.process(forecast_grid.copy())
 
 
+def test_different_thresholds(forecast_grid):
+    # test that error is raised when different forecast periods have different thresholds
+    msg = "Thresholds must be the same for all forecast periods"
+    recal_dict = {
+        "forecast_period": {
+            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0.5}}},
+            "1": {"threshold": {"274.0": {"alpha": 2, "beta": 1}}},
+        },
+        "forecast_period_units": "hours",
+        "threshold_units": "K",
+    }
+    plugin = BetaRecalibrate(recal_dict)
+    with pytest.raises(ValueError, match=msg):
+        plugin.process(forecast_grid.copy())
+
+
 def test_recalibrate(forecast_grid, recalibration_dict):
-    # test recalibration
+    # test recalibration with interpolation outside specified forecast period and threshold range
     plugin = BetaRecalibrate(recalibration_dict)
     result = plugin.process(forecast_grid.copy())
-    f1 = forecast_grid.extract(iris.Constraint(time=lambda cell: cell.point.hour == 4))
-    f2 = forecast_grid.extract(iris.Constraint(time=lambda cell: cell.point.hour == 8))
-    f1.data = beta.cdf(f1.data, 4, 8)
-    f2.data = beta.cdf(f2.data, 8, 16)
+    f1 = forecast_grid.extract(iris.Constraint(time=lambda cell: cell.point.hour == 2))
+    f2 = forecast_grid.extract(iris.Constraint(time=lambda cell: cell.point.hour == 6))
+    f1.data = beta.cdf(f1.data, 1, 1.5)
+    f2.data = beta.cdf(f2.data, 1, 2)
     expected = MergeCubes()([f1, f2])
     assert result.coords() == expected.coords()
     assert result.attributes == expected.attributes
-    np.testing.assert_almost_equal(expected.data, expected.data)
+    np.testing.assert_almost_equal(expected.data, result.data)
 
 
 def test_interpolation(forecast_grid):
-    # test values outside specified forecast period and thresholds are interpolated
+    # test with interpolation between specified forecast period and thresholds are interpolated
     recal_dict1 = {
         "forecast_period": {
-            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 1, "beta": 0}}},
-            "2": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 2, "beta": 0}}},
+            "0": {
+                "threshold": {
+                    "273.0": {"alpha": 2, "beta": 1},
+                    "275.0": {"alpha": 1, "beta": 1},
+                }
+            },
+            "2": {
+                "threshold": {
+                    "273.0": {"alpha": 2, "beta": 1},
+                    "275.0": {"alpha": 2, "beta": 1},
+                }
+            },
         },
         "forecast_units": "hours",
         "threshold_units": "K",
     }
     recal_dict2 = {
         "forecast_period": {
-            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 1.5, "beta": 0}, "275.0": {"alpha": 1, "beta": 0}}},
-            "1": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 1.75, "beta": 0}, "275.0": {"alpha": 1.5, "beta": 0}}},
-            "2": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 2, "beta": 0}}},
+            "0": {
+                "threshold": {
+                    "273.0": {"alpha": 2, "beta": 1},
+                    "274.0": {"alpha": 1.5, "beta": 1},
+                    "275.0": {"alpha": 1, "beta": 1},
+                }
+            },
+            "1": {
+                "threshold": {
+                    "273.0": {"alpha": 2, "beta": 1},
+                    "274.0": {"alpha": 1.75, "beta": 1},
+                    "275.0": {"alpha": 1.5, "beta": 1},
+                }
+            },
+            "2": {
+                "threshold": {
+                    "273.0": {"alpha": 2, "beta": 1},
+                    "274.0": {"alpha": 2, "beta": 1},
+                    "275.0": {"alpha": 2, "beta": 1},
+                }
+            },
         },
-        "forecast_units": "hours",
+        "forecast_period_units": "hours",
         "threshold_units": "K",
     }
     plugin = BetaRecalibrate(recal_dict1)
@@ -145,12 +189,11 @@ def test_interpolation(forecast_grid):
     np.testing.assert_almost_equal(result1.data, result2.data)
 
 
-
 def test_params_equal_1(forecast_grid):
     # check that recalibration has no effect when alpha = beta = 1
     recalibration_dict = {
         "forecast_period": {"0": {"threshold": {"273.0": {"alpha": 1, "beta": 1}}}},
-        "forecast_units": "hours",
+        "forecast_period_units": "hours",
         "threshold_units": "K",
     }
     plugin = BetaRecalibrate(recalibration_dict)
