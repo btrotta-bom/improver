@@ -56,58 +56,55 @@ def percentile_forecast_grid():
     return forecast
 
 
-def test_no_threshold_coord(percentile_forecast_grid):
+@pytest.fixture
+def recalibration_dict():
+    recal_dict = {
+        "forecast_period": {
+            "0": {"threshold": {"273.0": {"alpha": 0, "beta": 1}}},
+            "1": {"threshold": {"273.0": {"alpha": 1, "beta": 2}}},
+        },
+        "forecast_units": "hours",
+        "threshold_units": "K",
+    }
+    return recal_dict
+
+
+def test_no_threshold_coord(percentile_forecast_grid, recalibration_dict):
     # test that error is raised when the input is not a probability cube
     msg = "must be a probability forecast"
-    recalibration_dict = {
-        "forecast_period": [0, 1],
-        "alpha": [2, 0],
-        "beta": [2, 1],
-        "units": "hours",
-    }
     plugin = BetaRecalibrate(recalibration_dict)
     with pytest.raises(CoordinateNotFoundError, match=msg):
         plugin.process(percentile_forecast_grid.copy())
 
 
-def test_no_forecast_period_coord(forecast_grid):
+def test_no_forecast_period_coord(forecast_grid, recalibration_dict):
     # test that error is raised when the input does not contain
     # a forecast_period coordinate
     forecast_grid.remove_coord("forecast_period")
     msg = "must contain forecast_period coordinate"
-    recalibration_dict = {
-        "forecast_period": [0, 1],
-        "alpha": [2, 0],
-        "beta": [2, 1],
-        "units": "hours",
-    }
     plugin = BetaRecalibrate(recalibration_dict)
     with pytest.raises(CoordinateNotFoundError, match=msg):
         plugin.process(forecast_grid.copy())
 
 
-def test_invalid_params(forecast_grid):
+def test_invalid_params(forecast_grid, recalibration_dict):
     # test that error is raised when alpha or beta parameter is invalid
     msg = "interpolated alpha and beta parameters must be > 0"
-    recalibration_dict = {
-        "forecast_period": [0, 1],
-        "alpha": [2, 0],
-        "beta": [2, 1],
-        "units": "hours",
+    recal_dict = {
+        "forecast_period": {
+            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}}},
+            "1": {"threshold": {"273.0": {"alpha": 0, "beta": 1}}},
+        },
+        "forecast_units": "hours",
+        "threshold_units": "K",
     }
     plugin = BetaRecalibrate(recalibration_dict)
     with pytest.raises(RuntimeError, match=msg):
         plugin.process(forecast_grid.copy())
 
 
-def test_recalibrate(forecast_grid):
+def test_recalibrate(forecast_grid, recalibration_dict):
     # test recalibration
-    recalibration_dict = {
-        "forecast_period": [0, 1],
-        "alpha": [0, 1],
-        "beta": [0, 2],
-        "units": "hours",
-    }
     plugin = BetaRecalibrate(recalibration_dict)
     result = plugin.process(forecast_grid.copy())
     f1 = forecast_grid.extract(iris.Constraint(time=lambda cell: cell.point.hour == 4))
@@ -120,13 +117,41 @@ def test_recalibrate(forecast_grid):
     np.testing.assert_almost_equal(expected.data, expected.data)
 
 
+def test_interpolation(forecast_grid):
+    # test values outside specified forecast period and thresholds are interpolated
+    recal_dict1 = {
+        "forecast_period": {
+            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 1, "beta": 0}}},
+            "2": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 2, "beta": 0}}},
+        },
+        "forecast_units": "hours",
+        "threshold_units": "K",
+    }
+    recal_dict2 = {
+        "forecast_period": {
+            "0": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 1.5, "beta": 0}, "275.0": {"alpha": 1, "beta": 0}}},
+            "1": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 1.75, "beta": 0}, "275.0": {"alpha": 1.5, "beta": 0}}},
+            "2": {"threshold": {"273.0": {"alpha": 2, "beta": 0}, "274.0": {"alpha": 2, "beta": 0}, "275.0": {"alpha": 2, "beta": 0}}},
+        },
+        "forecast_units": "hours",
+        "threshold_units": "K",
+    }
+    plugin = BetaRecalibrate(recal_dict1)
+    result1 = plugin.process(forecast_grid.copy())
+    plugin = BetaRecalibrate(recal_dict2)
+    result2 = plugin.process(forecast_grid.copy())
+    assert result1.coords() == result2.coords()
+    assert result1.attributes == result2.attributes
+    np.testing.assert_almost_equal(result1.data, result2.data)
+
+
+
 def test_params_equal_1(forecast_grid):
     # check that recalibration has no effect when alpha = beta = 1
     recalibration_dict = {
-        "forecast_period": [0, 1],
-        "alpha": [1, 1],
-        "beta": [1, 1],
-        "units": "hours",
+        "forecast_period": {"0": {"threshold": {"273.0": {"alpha": 1, "beta": 1}}}},
+        "forecast_units": "hours",
+        "threshold_units": "K",
     }
     plugin = BetaRecalibrate(recalibration_dict)
     result = plugin.process(forecast_grid.copy())
